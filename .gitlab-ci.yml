@@ -363,9 +363,9 @@ deploy_to_infrastructure:
   before_script: []
   variables:
     DEPLOY_TARGET: "kubernetes"
-    K8S_CLUSTER: "irmai_agentic_platform-cluster"
+    K8S_CLUSTER: "rg-irmai-uat-us-1-cluster"
     DEPLOY_NAMESPACE: "default"
-    RESOURCE_GROUP: "irmai_agentic_platform"
+    RESOURCE_GROUP: "rg-irmai-uat-us-1"
     ORCHESTRATOR_URL: "https://b5cefeed5009.ngrok-free.app"
     DEPLOY_IMAGE: "irmaiuatregistry.azurecr.io/irmai-kg-v2-surrealdb:$CI_COMMIT_SHORT_SHA"
   script: |
