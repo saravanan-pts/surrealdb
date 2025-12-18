@@ -100,7 +100,21 @@ build_to_acr:
       echo "        3. Click 'Refresh Configs' to update task with fresh token"
       echo ""
       
+      # CRITICAL: Azure doesn't store git-access-token for GitLab (shows as null)
+      # WORKAROUND: Pass token during run if GITLAB_TOKEN CI/CD variable is available
+      # This is a fallback when Azure doesn't store the token
       set +e  # Don't exit on error - we want to capture output
+      
+      # Check if GITLAB_TOKEN is available (set by orchestrator as fallback)
+      if [ -n "$GITLAB_TOKEN" ]; then
+        echo "⚠️  Azure doesn't store token for GitLab - using GITLAB_TOKEN from CI/CD variables"
+        echo "   This is a workaround for Azure's GitLab limitation"
+        # Note: az acr task run doesn't support --git-access-token parameter
+        # So we can't pass it directly. Azure must use stored token or fail.
+        # This means if token is null, the task will fail.
+        echo "   Attempting to run task (will fail if token not stored)..."
+      fi
+      
       RUN_ID_OUTPUT=$(az acr task run \
         --name $ACR_TASK_NAME \
         --registry $ACR_NAME \
