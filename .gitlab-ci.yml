@@ -1,3 +1,4 @@
+# Tests disabled by Infra Orchestrator (skip_tests enabled)
 # Docker Application CI/CD Pipeline
 # Auto-generated for containerized application
 
@@ -89,11 +90,16 @@ build_to_acr:
       echo "=========================================="
       echo "STEP 2: Triggering ACR Task"
       echo "=========================================="
-      echo "Strategy: Try with stored token first, fallback to GITLAB_TOKEN if available"
+      echo "Command: az acr task run --name $ACR_TASK_NAME --registry $ACR_NAME --resource-group $ACR_RESOURCE_GROUP --set GIT_REF=$GIT_REF --query 'runId' -o tsv"
+      echo ""
+      echo "Note: ACR Task uses token stored during creation/update (from GitLab integration)"
+      echo "      Token is stored via 'az acr task create/update --git-access-token'"
+      echo "      If this fails with 'failed to download context':"
+      echo "        1. Token stored in ACR Task may be expired"
+      echo "        2. Token may not have 'read_repository' scope"
+      echo "        3. Click 'Refresh Configs' to update task with fresh token"
       echo ""
       
-      # Try first without explicit token (uses stored token)
-      echo "Attempt 1: Using token stored in ACR Task..."
       set +e  # Don't exit on error - we want to capture output
       RUN_ID_OUTPUT=$(az acr task run \
         --name $ACR_TASK_NAME \
@@ -104,35 +110,6 @@ build_to_acr:
       RUN_ID_EXIT=$?
       set -e
       
-      # Check if it failed with token error
-      if [ $RUN_ID_EXIT -ne 0 ] && echo "$RUN_ID_OUTPUT" | grep -q "failed to download context"; then
-        echo "⚠️  Stored token failed, trying with GITLAB_TOKEN from CI/CD variables..."
-        
-        # Try with explicit token from CI/CD variable (if available)
-        if [ -n "$GITLAB_TOKEN" ]; then
-          echo "Attempt 2: Using GITLAB_TOKEN from CI/CD variables..."
-          set +e
-          RUN_ID_OUTPUT=$(az acr task run \
-            --name $ACR_TASK_NAME \
-            --registry $ACR_NAME \
-            --resource-group $ACR_RESOURCE_GROUP \
-            --set GIT_REF=$GIT_REF \
-            --git-access-token "$GITLAB_TOKEN" \
-            --query 'runId' -o tsv 2>&1)
-          RUN_ID_EXIT=$?
-          set -e
-          
-          if [ $RUN_ID_EXIT -eq 0 ]; then
-            echo "✅ Success with GITLAB_TOKEN from CI/CD variables"
-          else
-            echo "❌ Still failed even with GITLAB_TOKEN"
-          fi
-        else
-          echo "⚠️  GITLAB_TOKEN not available in CI/CD variables"
-        fi
-      fi
-      
-      echo ""
       echo "Exit code: $RUN_ID_EXIT"
       echo "Full output:"
       echo "----------------------------------------"
