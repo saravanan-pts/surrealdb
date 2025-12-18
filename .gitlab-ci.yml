@@ -7,10 +7,10 @@ stages:
   - deploy
 
 
-# Build Docker image using Azure Container Registry Tasks
+# Build Docker image using Azure Container Registry Build (az acr build)
 # This builds in Azure infrastructure (unlimited disk space!) instead of GitLab runner
-# ACR Task is created/updated by orchestrator when "Refresh Configs" is clicked
-# Token is passed via --git-access-token to ensure fresh access to GitLab repository
+# Uses az acr build which supports GitLab authentication via token in URL
+# ACR Task approach failed because Azure doesn't store git-access-token for GitLab
 build_to_acr:
   stage: build
   image: mcr.microsoft.com/azure-cli:latest
@@ -23,16 +23,20 @@ build_to_acr:
     ORCHESTRATOR_URL: "https://b5cefeed5009.ngrok-free.app"
     GIT_REF: "$CI_COMMIT_REF_NAME"
   before_script:
-    - echo "=== Using Azure Container Registry Tasks ==="
+    - echo "=== Using Azure Container Registry Build (az acr build) ==="
     - 'echo "ACR: $ACR_REGISTRY"'
-    - 'echo "Task: $ACR_TASK_NAME"'
     - 'echo "Image: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"'
     - echo "Building in Azure (no GitLab runner disk space limitations!)"
+    - echo ""
+    - echo "⚠️  WORKAROUND: Using az acr build instead of ACR Tasks"
+    - echo "   Reason: Azure ACR Tasks doesn't store git-access-token for GitLab"
+    - echo "   Solution: az acr build supports token in URL format"
     - |
       # Azure login - skip managed identity (not available on GitLab runners)
       if [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_CLIENT_SECRET" ] || [ -z "$AZURE_TENANT_ID" ]; then
-        echo "⚠️  Azure credentials not set - ACR Task may fail"
+        echo "❌ ERROR: Azure credentials not set"
         echo "   Set AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID as CI/CD variables"
+        exit 1
       else
         echo "🔐 Logging in to Azure with service principal..."
         az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output none
@@ -45,11 +49,10 @@ build_to_acr:
       set -o pipefail
       
       echo "=========================================="
-      echo "🚀 ACR Task Build - Starting"
+      echo "🚀 ACR Build - Starting"
       echo "=========================================="
       echo ""
       echo "📋 Configuration:"
-      echo "   Task Name: $ACR_TASK_NAME"
       echo "   Registry: $ACR_NAME"
       echo "   Resource Group: $ACR_RESOURCE_GROUP"
       echo "   Git Ref: $GIT_REF"
@@ -57,312 +60,59 @@ build_to_acr:
       echo "   Image: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"
       echo ""
       
-      # Step 1: Verify ACR Task exists
-      echo "=========================================="
-      echo "STEP 1: Verifying ACR Task exists"
-      echo "=========================================="
-      echo "Command: az acr task show --name $ACR_TASK_NAME --registry $ACR_NAME --resource-group $ACR_RESOURCE_GROUP"
-      echo ""
-      
-      set +e  # Don't exit on error yet
-      TASK_CHECK_OUTPUT=$(az acr task show --name $ACR_TASK_NAME --registry $ACR_NAME --resource-group $ACR_RESOURCE_GROUP 2>&1)
-      TASK_CHECK_EXIT=$?
-      set -e
-      
-      echo "Exit code: $TASK_CHECK_EXIT"
-      echo "Output:"
-      echo "$TASK_CHECK_OUTPUT"
-      echo ""
-      
-      if [ $TASK_CHECK_EXIT -ne 0 ]; then
-        echo "❌ ERROR: ACR Task does not exist or is not accessible!"
-        echo ""
-        echo "💡 SOLUTION: Click 'Refresh Configs' in orchestrator UI to create the ACR Task"
-        echo "   URL: http://localhost:3331/gitlab/applications/{projectId}"
-        echo ""
+      # Build GitLab repository URL with token
+      # Format: https://oauth2:TOKEN@gitlab.com/team-irmai/repo.git#branch
+      if [ -z "$GITLAB_TOKEN" ]; then
+        echo "❌ ERROR: GITLAB_TOKEN CI/CD variable not set"
+        echo "   This is required for az acr build to access private GitLab repository"
+        echo "   The orchestrator should set this automatically"
         exit 1
       fi
       
-      echo "✅ ACR Task exists and is accessible"
+      GITLAB_REPO_URL="https://oauth2:${GITLAB_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git#${GIT_REF}"
+      echo "🔗 GitLab Repository URL: https://oauth2:***@gitlab.com/${CI_PROJECT_PATH}.git#${GIT_REF}"
       echo ""
       
-      # Step 2: Trigger ACR Task
       echo "=========================================="
-      echo "STEP 2: Triggering ACR Task"
+      echo "STEP 1: Building image with az acr build"
       echo "=========================================="
-      echo "Command: az acr task run --name $ACR_TASK_NAME --registry $ACR_NAME --resource-group $ACR_RESOURCE_GROUP --set GIT_REF=$GIT_REF --query 'runId' -o tsv"
-      echo ""
-      echo "Note: ACR Task uses token stored during creation/update (from GitLab integration)"
-      echo "      Token is stored via 'az acr task create/update --git-access-token'"
-      echo "      If this fails with 'failed to download context':"
-      echo "        1. Token stored in ACR Task may be expired"
-      echo "        2. Token may not have 'read_repository' scope"
-      echo "        3. Click 'Refresh Configs' to update task with fresh token"
+      echo "Command: az acr build --registry $ACR_NAME --image $APP_NAME:$CI_COMMIT_SHORT_SHA --file Dockerfile --resource-group $ACR_RESOURCE_GROUP $GITLAB_REPO_URL"
       echo ""
       
-      # CRITICAL: Azure doesn't store git-access-token for GitLab (shows as null)
-      # WORKAROUND: Pass token during run if GITLAB_TOKEN CI/CD variable is available
-      # This is a fallback when Azure doesn't store the token
       set +e  # Don't exit on error - we want to capture output
-      
-      # Check if GITLAB_TOKEN is available (set by orchestrator as fallback)
-      if [ -n "$GITLAB_TOKEN" ]; then
-        echo "⚠️  Azure doesn't store token for GitLab - using GITLAB_TOKEN from CI/CD variables"
-        echo "   This is a workaround for Azure's GitLab limitation"
-        # Note: az acr task run doesn't support --git-access-token parameter
-        # So we can't pass it directly. Azure must use stored token or fail.
-        # This means if token is null, the task will fail.
-        echo "   Attempting to run task (will fail if token not stored)..."
-      fi
-      
-      RUN_ID_OUTPUT=$(az acr task run \
-        --name $ACR_TASK_NAME \
+      BUILD_OUTPUT=$(az acr build \
         --registry $ACR_NAME \
+        --image $APP_NAME:$CI_COMMIT_SHORT_SHA \
+        --image $APP_NAME:latest \
+        --file Dockerfile \
         --resource-group $ACR_RESOURCE_GROUP \
-        --set GIT_REF=$GIT_REF \
-        --query 'runId' -o tsv 2>&1)
-      RUN_ID_EXIT=$?
+        "$GITLAB_REPO_URL" 2>&1)
+      BUILD_EXIT=$?
       set -e
       
-      echo "Exit code: $RUN_ID_EXIT"
-      echo "Full output:"
+      echo "Exit code: $BUILD_EXIT"
+      echo "Build output:"
       echo "----------------------------------------"
-      echo "$RUN_ID_OUTPUT"
-      echo "----------------------------------------"
-      echo ""
-      
-      echo "Exit code: $RUN_ID_EXIT"
-      echo "Full output:"
-      echo "----------------------------------------"
-      echo "$RUN_ID_OUTPUT"
+      echo "$BUILD_OUTPUT"
       echo "----------------------------------------"
       echo ""
       
-      if [ $RUN_ID_EXIT -ne 0 ]; then
-        echo "❌ ERROR: Failed to trigger ACR Task"
+      if [ $BUILD_EXIT -ne 0 ]; then
+        echo "❌ ERROR: az acr build failed"
         echo ""
         echo "🔍 Troubleshooting:"
-        echo "   1. Check if task exists:"
-        echo "      az acr task show --name $ACR_TASK_NAME --registry $ACR_NAME --resource-group $ACR_RESOURCE_GROUP"
-        echo ""
-        echo "   2. Check service principal permissions:"
-        echo "      az role assignment list --assignee $AZURE_CLIENT_ID"
-        echo ""
-        echo "   3. If error is 'failed to download context':"
-        echo "      - Token stored in ACR Task may be expired"
-        echo "      - Click 'Refresh Configs' to recreate task with fresh token"
-        echo ""
-        echo "   4. Check ACR Task configuration:"
-        echo "      az acr task show --name $ACR_TASK_NAME --registry $ACR_NAME --resource-group $ACR_RESOURCE_GROUP -o json"
-        echo ""
+        echo "   1. Check if GITLAB_TOKEN has read_repository scope"
+        echo "   2. Check if repository URL is correct"
+        echo "   3. Check Azure service principal permissions"
+        echo "   4. Check if Dockerfile exists in repository"
         exit 1
       fi
       
-      # Extract RUN_ID from output
       echo "=========================================="
-      echo "STEP 3: Extracting Run ID"
+      echo "✅✅✅ ACR Build Complete!"
       echo "=========================================="
-      echo "Parsing output to extract Run ID..."
-      echo ""
-      
-      # Method 1: Look for "run with ID: xxx" pattern
-      RUN_ID=$(echo "$RUN_ID_OUTPUT" | grep -oE 'run with ID: [a-z0-9]{3,4}' | sed 's/.*: //' | head -1 || echo "")
-      
-      # Method 2: Look for standalone 3-4 character alphanumeric strings
-      if [ -z "$RUN_ID" ]; then
-        RUN_ID=$(echo "$RUN_ID_OUTPUT" | grep -oE '\b[a-z0-9]{3,4}\b' | head -1 || echo "")
-      fi
-      
-      # Method 3: Look for exact match on a line
-      if [ -z "$RUN_ID" ]; then
-        RUN_ID=$(echo "$RUN_ID_OUTPUT" | grep -xE '[a-z0-9]{3,4}' | head -1 | tr -d '[:space:]' || echo "")
-      fi
-      
-      # Method 4: Try JSON parsing
-      if [ -z "$RUN_ID" ]; then
-        RUN_ID=$(echo "$RUN_ID_OUTPUT" | grep -oE '"runId"[[:space:]]*:[[:space:]]*"[a-z0-9]{3,4}"' | sed 's/.*"runId"[[:space:]]*:[[:space:]]*"//' | sed 's/".*//' | head -1 || echo "")
-      fi
-      
-      if [ -z "$RUN_ID" ]; then
-        echo "❌ ERROR: Failed to extract Run ID from output"
-        echo ""
-        echo "Raw output:"
-        echo "----------------------------------------"
-        echo "$RUN_ID_OUTPUT"
-        echo "----------------------------------------"
-        echo ""
-        echo "Expected format: 3-4 character alphanumeric string (e.g., 'cak', 'car', 'ca12')"
-        exit 1
-      fi
-      
-      RUN_ID=$(echo "$RUN_ID" | tr -d '[:space:]')
-      echo "✅ Extracted Run ID: $RUN_ID"
-      echo ""
-      
-      # Step 4: Wait for build to complete
-      echo "=========================================="
-      echo "STEP 4: Waiting for build to complete"
-      echo "=========================================="
-      echo "Run ID: $RUN_ID"
-      echo "Timeout: 1800 seconds (30 minutes)"
-      echo "Check interval: 10 seconds"
-      echo ""
-      
-      TIMEOUT=1800
-      ELAPSED=0
-      INTERVAL=10
-      BUILD_COMPLETED=false
-      LAST_STATUS=""
-      
-      while [ $ELAPSED -lt $TIMEOUT ] && [ "$BUILD_COMPLETED" != "true" ]; do
-        set +e
-        STATUS_OUTPUT=$(az acr task show-run \
-          --registry $ACR_NAME \
-          --run-id $RUN_ID \
-          --resource-group $ACR_RESOURCE_GROUP \
-          --query 'status' -o tsv 2>&1)
-        STATUS_EXIT_CODE=$?
-        set -e
-        
-        STATUS=$(echo "$STATUS_OUTPUT" | head -n 1 | tr -d '[:space:]')
-        
-        # Log status changes or every 60 seconds
-        if [ "$STATUS" != "$LAST_STATUS" ] || [ $((ELAPSED % 60)) -eq 0 ]; then
-          if [ -n "$STATUS" ] && [ "$STATUS" != "" ]; then
-            echo "📊 Status: $STATUS (elapsed: ${ELAPSED}s)"
-          else
-            echo "⚠️  Status check failed (exit code: $STATUS_EXIT_CODE)"
-            echo "   Output: $STATUS_OUTPUT"
-          fi
-          LAST_STATUS="$STATUS"
-        fi
-        
-        if [ $STATUS_EXIT_CODE -eq 0 ] && [ -n "$STATUS" ]; then
-          case "$STATUS" in
-            Succeeded|succeeded|SUCCEEDED)
-              echo ""
-              echo "✅ Build completed successfully!"
-              BUILD_COMPLETED=true
-              break
-              ;;
-            Failed|failed|FAILED)
-              echo ""
-              echo "❌ ERROR: Build failed (status: $STATUS)"
-              echo ""
-              echo "Getting build logs..."
-              set +e
-              az acr task logs --registry $ACR_NAME --run-id $RUN_ID --resource-group $ACR_RESOURCE_GROUP 2>&1 | head -50
-              set -e
-              exit 1
-              ;;
-          esac
-        fi
-        
-        sleep $INTERVAL
-        ELAPSED=$((ELAPSED + INTERVAL))
-      done
-      
-      if [ "$BUILD_COMPLETED" != "true" ]; then
-        echo ""
-        echo "⏰ WARNING: Timeout reached after $TIMEOUT seconds"
-        echo "Performing final status check..."
-        echo ""
-        
-        set +e
-        FINAL_STATUS_OUTPUT=$(az acr task show-run \
-          --registry $ACR_NAME \
-          --run-id $RUN_ID \
-          --resource-group $ACR_RESOURCE_GROUP \
-          --query 'status' -o tsv 2>&1)
-        FINAL_EXIT=$?
-        set -e
-        
-        FINAL_STATUS=$(echo "$FINAL_STATUS_OUTPUT" | head -n 1 | tr -d '[:space:]')
-        
-        echo "Final status check result (exit code: $FINAL_EXIT):"
-        echo "$FINAL_STATUS_OUTPUT"
-        echo ""
-        
-        case "$FINAL_STATUS" in
-          Succeeded|succeeded|SUCCEEDED)
-            echo "✅ Build completed successfully (status check was delayed)"
-            BUILD_COMPLETED=true
-            ;;
-          *)
-            echo "❌ ERROR: Build did not complete in time"
-            echo "   Final status: $FINAL_STATUS"
-            echo ""
-            echo "Getting build logs..."
-            set +e
-            az acr task logs --registry $ACR_NAME --run-id $RUN_ID --resource-group $ACR_RESOURCE_GROUP 2>&1 | head -50
-            set -e
-            exit 1
-            ;;
-        esac
-      fi
-      
-      # Step 5: Get built image and retag
-      echo ""
-      echo "=========================================="
-      echo "STEP 5: Getting built image and retagging"
-      echo "=========================================="
-      
-      set +e
-      ACTUAL_IMAGE_OUTPUT=$(az acr task show-run \
-        --registry $ACR_NAME \
-        --run-id $RUN_ID \
-        --resource-group $ACR_RESOURCE_GROUP \
-        --query 'outputImages[0]' -o tsv 2>&1)
-      IMAGE_EXIT=$?
-      set -e
-      
-      echo "Command exit code: $IMAGE_EXIT"
-      echo "Output: $ACTUAL_IMAGE_OUTPUT"
-      echo ""
-      
-      if [ $IMAGE_EXIT -eq 0 ] && [ -n "$ACTUAL_IMAGE_OUTPUT" ] && [[ ! "$ACTUAL_IMAGE_OUTPUT" == *"error"* ]]; then
-        ACTUAL_IMAGE="$ACTUAL_IMAGE_OUTPUT"
-        echo "✅ Got built image from task run: $ACTUAL_IMAGE"
-      else
-        echo "⚠️  Could not get built image from task run, using expected format"
-        ACTUAL_IMAGE="$ACR_REGISTRY/$APP_NAME:$RUN_ID"
-        echo "   Using: $ACTUAL_IMAGE"
-      fi
-      echo ""
-      
-      echo "🏷️  Retagging with commit SHA: $CI_COMMIT_SHORT_SHA"
-      IMAGE_NAME_ONLY=$(echo "$ACTUAL_IMAGE" | sed 's/.*\///' | sed 's/:.*//')
-      SOURCE_TAG=$(echo "$ACTUAL_IMAGE" | sed 's/.*://')
-      
-      echo "   Source: $ACR_REGISTRY/$IMAGE_NAME_ONLY:$SOURCE_TAG"
-      echo "   Target: $IMAGE_NAME_ONLY:$CI_COMMIT_SHORT_SHA"
-      echo ""
-      
-      set +e
-      RETAG_OUTPUT=$(az acr import \
-        --name $ACR_NAME \
-        --source "$ACR_REGISTRY/$IMAGE_NAME_ONLY:$SOURCE_TAG" \
-        --image "$IMAGE_NAME_ONLY:$CI_COMMIT_SHORT_SHA" \
-        --resource-group $ACR_RESOURCE_GROUP 2>&1)
-      RETAG_EXIT=$?
-      set -e
-      
-      echo "Retag command exit code: $RETAG_EXIT"
-      if [ $RETAG_EXIT -ne 0 ]; then
-        echo "⚠️  Retagging failed (this is often expected for same-registry imports)"
-        echo "   Output: $RETAG_OUTPUT"
-        echo "   Note: Image exists with Run.ID tag ($RUN_ID), deployment can use that"
-      else
-        echo "✅ Successfully retagged: $ACR_REGISTRY/$IMAGE_NAME_ONLY:$CI_COMMIT_SHORT_SHA"
-      fi
-      echo ""
-      
-      echo "=========================================="
-      echo "✅✅✅ ACR Task Build Complete!"
-      echo "=========================================="
-      echo "   Run ID: $RUN_ID"
-      echo "   Built image: $ACTUAL_IMAGE"
-      echo "   Commit SHA tag: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"
+      echo "   Built image: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"
+      echo "   Latest tag: $ACR_REGISTRY/$APP_NAME:latest"
       echo "=========================================="
         - "[ -z \"$ORCHESTRATOR_URL\" ] && echo \"ORCHESTRATOR_URL not set; skipping Key Vault secret download\" && exit 0"
     - apk add --no-cache curl >/tmp/curl-install.log 2>&1 || { echo "⚠️  Failed to install curl"; cat /tmp/curl-install.log; exit 1; }
