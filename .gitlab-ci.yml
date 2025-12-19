@@ -7,10 +7,9 @@ stages:
   - deploy
 
 
-# Build Docker image using Azure Container Registry Build (az acr build)
-# This builds in Azure infrastructure (unlimited disk space!) instead of GitLab runner
-# Uses az acr build which supports GitLab authentication via token in URL
-# ACR Task approach failed because Azure doesn't store git-access-token for GitLab
+# Build Docker image and push to Azure Container Registry
+# Builds in GitLab CI (with disk space management) and pushes to ACR
+# This is the proven working approach (see SUCCESS_ACR_DEPLOYMENT_WORKING.md)
 build_to_acr:
   stage: build
   image: mcr.microsoft.com/azure-cli:latest
