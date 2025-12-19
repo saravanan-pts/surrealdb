@@ -18,7 +18,9 @@ build_to_acr:
   variables:
     ACR_REGISTRY: "irmaiuatregistry.azurecr.io"
     APP_NAME: "irmai-kg-v2-surrealdb"
-    ORCHESTRATOR_URL: "https://b5cefeed5009.ngrok-free.app"
+    # ORCHESTRATOR_URL should be set in GitLab CI/CD Variables (Settings → CI/CD → Variables)
+    # DO NOT use ngrok URLs - use your Azure service URL instead
+    # Example: https://infra-orchestrator.eastus.azurecontainerapps.io
   before_script:
     - echo "=== Building Docker image and pushing to Azure Container Registry ==="
     - 'echo "ACR: $ACR_REGISTRY"'
@@ -113,7 +115,10 @@ deploy_to_infrastructure:
     K8S_CLUSTER: "rg-irmai-uat-us-1-cluster"
     DEPLOY_NAMESPACE: "default"
     RESOURCE_GROUP: "rg-irmai-uat-us-1"
-    ORCHESTRATOR_URL: "https://b5cefeed5009.ngrok-free.app"
+    # ORCHESTRATOR_URL should be set in GitLab CI/CD Variables (Settings → CI/CD → Variables)
+    # DO NOT use ngrok URLs - use your Azure service URL instead
+    # Example: https://infra-orchestrator.eastus.azurecontainerapps.io
+    # If not set, the script will show an error with instructions
     DEPLOY_IMAGE: "irmaiuatregistry.azurecr.io/irmai-kg-v2-surrealdb:$CI_COMMIT_SHORT_SHA"
   script: |
     echo "=== Deployment to Infrastructure ==="
@@ -227,7 +232,17 @@ deploy_to_infrastructure:
     if not url_base:
         print("❌ ORCHESTRATOR_URL is not set", file=sys.stderr)
         print("   Please set ORCHESTRATOR_URL in GitLab CI/CD variables", file=sys.stderr)
+        print("   Settings → CI/CD → Variables → Add Variable", file=sys.stderr)
+        print("   Use your Azure service URL (NOT ngrok!)", file=sys.stderr)
+        print("   Example: https://infra-orchestrator.eastus.azurecontainerapps.io", file=sys.stderr)
         sys.exit(1)
+    
+    # Warn if using ngrok (development tool, not for production)
+    if "ngrok" in url_base.lower():
+        print("⚠️  WARNING: ORCHESTRATOR_URL contains 'ngrok'", file=sys.stderr)
+        print("   ngrok is for local development only, not for cloud deployments!", file=sys.stderr)
+        print("   Please update ORCHESTRATOR_URL to your Azure service URL", file=sys.stderr)
+        print("   Example: https://infra-orchestrator.eastus.azurecontainerapps.io", file=sys.stderr)
     
     # Validate URL format
     url_base = url_base.rstrip("/")
