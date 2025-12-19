@@ -88,15 +88,15 @@ build_to_acr:
     - docker logout $ACR_REGISTRY || true
         - "[ -z \"$ORCHESTRATOR_URL\" ] && echo \"ORCHESTRATOR_URL not set; skipping Key Vault secret download\" && exit 0"
     - apk add --no-cache curl >/tmp/curl-install.log 2>&1 || { echo "⚠️  Failed to install curl"; cat /tmp/curl-install.log; exit 1; }
-    - "response_status=$(curl -sS -o keyvault.env -w \"%{http_code}\" -X POST \"$ORCHESTRATOR_URL/keyvault/env\" -H \"Content-Type: application/json\" -d '{\"application_name\":\"'$CI_PROJECT_NAME'\",\"format\":\"dotenv\"}}')"
-    - "[ \"$response_status\" = \"200\" ] && mv keyvault.env .env && echo \"✅ Secrets written to .env\" || (rm -f keyvault.env && echo \"ℹ️  No secrets fetched from orchestrator (status $response_status)\")"
+    - "response_status=$(curl -sS -o keyvault.env -w \"%{http_code}\" -X POST \"$ORCHESTRATOR_URL/keyvault/env\" -H \"Content-Type: application/json\" -d '{\"application_name\":\"'$CI_PROJECT_NAME'\",\"format\":\"dotenv\"}')"
+    - "[ \"$response_status\" = \"200\" ] && mv keyvault.env .env && ([ \".\" != \".\" ] && cp .env \"./.env\" || true) && echo \"✅ Secrets written to .env\" || (rm -f keyvault.env && echo \"ℹ️  No secrets fetched from orchestrator (status $response_status)\")"
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: on_success
     - if: $TRIGGER_DEPLOY == "true"
       when: on_success
     - exists:
-        - Dockerfile
+        - docker-compose.yml
       when: on_success
 
 
