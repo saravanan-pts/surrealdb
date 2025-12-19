@@ -12,35 +12,19 @@ stages:
 # This is the proven working approach (see SUCCESS_ACR_DEPLOYMENT_WORKING.md)
 build_to_acr:
   stage: build
-  image: mcr.microsoft.com/azure-cli:latest
+  image: docker:24-dind
+  services:
+    - docker:24-dind
   variables:
-    ACR_TASK_NAME: "irmai-kg-v2-surrealdb"
-    ACR_NAME: "irmaiuatregistry"
     ACR_REGISTRY: "irmaiuatregistry.azurecr.io"
-    ACR_RESOURCE_GROUP: "rg-irmai-uat-us-1"
     APP_NAME: "irmai-kg-v2-surrealdb"
     ORCHESTRATOR_URL: "https://b5cefeed5009.ngrok-free.app"
-    GIT_REF: "$CI_COMMIT_REF_NAME"
   before_script:
-    - echo "=== Using Azure Container Registry Build (az acr build) ==="
+    - echo "=== Building Docker image and pushing to Azure Container Registry ==="
     - 'echo "ACR: $ACR_REGISTRY"'
     - 'echo "Image: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"'
-    - echo "Building in Azure (no GitLab runner disk space limitations!)"
-    - echo ""
-    - echo "⚠️  WORKAROUND: Using az acr build instead of ACR Tasks"
-    - echo "   Reason: Azure ACR Tasks doesn't store git-access-token for GitLab"
-    - echo "   Solution: az acr build supports token in URL format"
-    - |
-      # Azure login - skip managed identity (not available on GitLab runners)
-      if [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_CLIENT_SECRET" ] || [ -z "$AZURE_TENANT_ID" ]; then
-        echo "❌ ERROR: Azure credentials not set"
-        echo "   Set AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID as CI/CD variables"
-        exit 1
-      else
-        echo "🔐 Logging in to Azure with service principal..."
-        az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output none
-        echo "✅ Azure login successful"
-      fi
+    - echo "Logging into Azure Container Registry..."
+    - echo $ACR_PASSWORD | docker login $ACR_REGISTRY -u $ACR_USERNAME --password-stdin
   script:
     - |
       # Enable error handling
@@ -48,71 +32,60 @@ build_to_acr:
       set -o pipefail
       
       echo "=========================================="
-      echo "🚀 ACR Build - Starting"
+      echo "🚀 Building Docker image"
       echo "=========================================="
       echo ""
       echo "📋 Configuration:"
-      echo "   Registry: $ACR_NAME"
-      echo "   Resource Group: $ACR_RESOURCE_GROUP"
-      echo "   Git Ref: $GIT_REF"
+      echo "   Registry: $ACR_REGISTRY"
+      echo "   Image: $APP_NAME"
       echo "   Commit SHA: $CI_COMMIT_SHORT_SHA"
-      echo "   Image: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"
+      echo "   Full image: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"
       echo ""
       
-      # Build GitLab repository URL with token
-      # Format: https://oauth2:TOKEN@gitlab.com/team-irmai/repo.git#branch
-      if [ -z "$GITLAB_TOKEN" ]; then
-        echo "❌ ERROR: GITLAB_TOKEN CI/CD variable not set"
-        echo "   This is required for az acr build to access private GitLab repository"
-        echo "   The orchestrator should set this automatically"
-        exit 1
-      fi
+      # Disk space management (critical for GitLab runners)
+      echo "🧹 Cleaning up disk space before build..."
+      docker system prune -f || true
+      docker images --filter "dangling=true" -q | xargs -r docker rmi -f || true
+      echo "Disk space before build:"
+      df -h || true
+      echo ""
       
-      GITLAB_REPO_URL="https://oauth2:${GITLAB_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git#${GIT_REF}"
-      echo "🔗 GitLab Repository URL: https://oauth2:***@gitlab.com/${CI_PROJECT_PATH}.git#${GIT_REF}"
+      # Pull previous image for cache (if exists)
+      echo "📥 Pulling previous image for cache (if exists)..."
+      docker pull $ACR_REGISTRY/$APP_NAME:latest || echo "No previous image found, building from scratch"
+      echo ""
+      
+      # Build image with cache
+      echo "🏗️  Building Docker image with cache..."
+      docker build \
+        --cache-from $ACR_REGISTRY/$APP_NAME:latest \
+        -t $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA \
+        -t $ACR_REGISTRY/$APP_NAME:latest \
+        .
+      echo ""
+      
+      # Push images
+      echo "📤 Pushing images to ACR..."
+      echo "   Pushing commit SHA tag: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"
+      docker push $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA
+      echo "   Pushing latest tag: $ACR_REGISTRY/$APP_NAME:latest"
+      docker push $ACR_REGISTRY/$APP_NAME:latest
+      echo ""
+      
+      # Cleanup to free space
+      echo "🧹 Cleaning up after build..."
+      docker rmi $ACR_REGISTRY/$APP_NAME:latest || echo "Failed to remove cache image, continuing..."
+      docker system prune -f || true
       echo ""
       
       echo "=========================================="
-      echo "STEP 1: Building image with az acr build"
+      echo "✅✅✅ Build Complete!"
       echo "=========================================="
-      echo "Command: az acr build --registry $ACR_NAME --image $APP_NAME:$CI_COMMIT_SHORT_SHA --file Dockerfile --resource-group $ACR_RESOURCE_GROUP $GITLAB_REPO_URL"
-      echo ""
-      
-      set +e  # Don't exit on error - we want to capture output
-      BUILD_OUTPUT=$(az acr build \
-        --registry $ACR_NAME \
-        --image $APP_NAME:$CI_COMMIT_SHORT_SHA \
-        --image $APP_NAME:latest \
-        --file Dockerfile \
-        --resource-group $ACR_RESOURCE_GROUP \
-        "$GITLAB_REPO_URL" 2>&1)
-      BUILD_EXIT=$?
-      set -e
-      
-      echo "Exit code: $BUILD_EXIT"
-      echo "Build output:"
-      echo "----------------------------------------"
-      echo "$BUILD_OUTPUT"
-      echo "----------------------------------------"
-      echo ""
-      
-      if [ $BUILD_EXIT -ne 0 ]; then
-        echo "❌ ERROR: az acr build failed"
-        echo ""
-        echo "🔍 Troubleshooting:"
-        echo "   1. Check if GITLAB_TOKEN has read_repository scope"
-        echo "   2. Check if repository URL is correct"
-        echo "   3. Check Azure service principal permissions"
-        echo "   4. Check if Dockerfile exists in repository"
-        exit 1
-      fi
-      
-      echo "=========================================="
-      echo "✅✅✅ ACR Build Complete!"
-      echo "=========================================="
-      echo "   Built image: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"
+      echo "   Built and pushed: $ACR_REGISTRY/$APP_NAME:$CI_COMMIT_SHORT_SHA"
       echo "   Latest tag: $ACR_REGISTRY/$APP_NAME:latest"
       echo "=========================================="
+  after_script:
+    - docker logout $ACR_REGISTRY || true
         - "[ -z \"$ORCHESTRATOR_URL\" ] && echo \"ORCHESTRATOR_URL not set; skipping Key Vault secret download\" && exit 0"
     - apk add --no-cache curl >/tmp/curl-install.log 2>&1 || { echo "⚠️  Failed to install curl"; cat /tmp/curl-install.log; exit 1; }
     - "response_status=$(curl -sS -o keyvault.env -w \"%{http_code}\" -X POST \"$ORCHESTRATOR_URL/keyvault/env\" -H \"Content-Type: application/json\" -d '{\"application_name\":\"'$CI_PROJECT_NAME'\",\"format\":\"dotenv\"}}')"
