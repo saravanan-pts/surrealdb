@@ -255,7 +255,7 @@ export default function Home() {
   const handleEdgeSelect = async (edgeId: string) => {
     try {
       // Try to get relationship from store first
-      let relationship = relationships.find((r) => r.id === edgeId);
+      let relationship: Relationship | null | undefined = relationships.find((r) => r.id === edgeId);
       
       // If not found, fetch from database
       if (!relationship) {

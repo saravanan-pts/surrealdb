@@ -535,7 +535,14 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
             const targetPos = targetNode.position();
             const midX = (sourcePos.x + targetPos.x) / 2;
             const midY = (sourcePos.y + targetPos.y) / 2;
-            cyRef.current.center({ x: midX, y: midY });
+            // Get current viewport center and pan to the midpoint
+            const extent = cyRef.current.extent();
+            const currentCenterX = (extent.x1 + extent.x2) / 2;
+            const currentCenterY = (extent.y1 + extent.y2) / 2;
+            cyRef.current.pan({
+              x: midX - currentCenterX,
+              y: midY - currentCenterY,
+            });
           }
         } catch (error) {
           console.error("Error highlighting edge:", error);

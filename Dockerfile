@@ -1,21 +1,21 @@
 # Stage 1: Dependencies
-FROM node:18-alpine AS deps
+FROM node:20-alpine AS deps
 WORKDIR /app
 
 # Copy package files
 COPY package.json package-lock.json* ./
 
-# Install dependencies (including dev dependencies for build)
+# Install dependencies
 RUN npm ci
 
 # Stage 2: Builder
-FROM node:18-alpine AS builder
+FROM node:20-alpine AS builder
 WORKDIR /app
 
 # Copy dependencies from deps stage
 COPY --from=deps /app/node_modules ./node_modules
 
-# Copy application source
+# Copy application code
 COPY . .
 
 # Set environment variables for build (Next.js needs these)
@@ -26,7 +26,7 @@ ENV NODE_ENV=production
 RUN npm run build
 
 # Stage 3: Runner
-FROM node:18-alpine AS runner
+FROM node:20-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
@@ -47,12 +47,11 @@ RUN chown -R nextjs:nodejs /app
 # Switch to non-root user
 USER nextjs
 
-# Expose port (defaults to 3111, can be overridden via PORT env var)
-EXPOSE 3111
+# Expose port (defaults to 3000, can be overridden via PORT env var)
+EXPOSE 3000
 
-ENV PORT=3111
+ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
 # Start the application
 CMD ["node", "server.js"]
-
