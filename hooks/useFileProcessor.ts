@@ -1,135 +1,73 @@
 import { useState, useCallback } from "react";
-import { useGraphStore } from "@/lib/store";
-import type { Entity, Relationship, Document } from "@/types";
-
-interface ProcessingResult {
-  document: Document;
-  entities: Entity[];
-  relationships: Relationship[];
-}
 
 export function useFileProcessor() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const { addEntity, addRelationship } = useGraphStore();
 
-  const processFile = useCallback(
-    async (file: File): Promise<ProcessingResult> => {
-      setIsProcessing(true);
-      setProgress(0);
-      setError(null);
+  const processFile = useCallback(async (file: File) => {
+    setIsProcessing(true);
+    setProgress(10);
+    setError(null);
 
-      try {
-        setProgress(25);
+    try {
+      // 1. Read File Content as Text (Client-side)
+      const textContent = await file.text();
+      setProgress(30);
 
-        // Use API route for file processing (server-side only)
-        const formData = new FormData();
-        formData.append("file", file);
+      // 2. (Optional Step) Call /api/analyze here if you want HITL
+      // For now, we will try to find a saved mapping in memory automatically
+      const analysisResponse = await fetch("/api/analyze", {
+        method: "POST",
+        body: new FormData().append("file", file) as any || (() => {
+            // Fallback: Create FormData manually if needed, 
+            // but for analyze we can also send JSON if we updated that route.
+            // Let's stick to the Process route fix first.
+            const fd = new FormData();
+            fd.append("file", file);
+            return fd;
+        })(),
+      });
+      
+      // Note: If you haven't updated /api/analyze to return JSON yet, 
+      // this part might need adjustment. 
+      // For this fix, let's assume we proceed to process directly.
 
-        const response = await fetch("/api/process", {
-          method: "POST",
-          body: formData,
-        });
+      // 3. Send to API as JSON
+      const response = await fetch("/api/process", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          fileName: file.name,
+          textContent: textContent,
+          // If you have the HITL modal, pass 'approvedMapping' here.
+          // Passing null/undefined relies on the backend's memory or strict default.
+          approvedMapping: null, 
+          saveToMemory: false
+        }),
+      });
 
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || "Failed to process file");
-        }
+      setProgress(70);
 
-        setProgress(75);
-        const data = await response.json();
-
-        if (!data.success) {
-          throw new Error(data.error || "Processing failed");
-        }
-
-        const result: ProcessingResult = {
-          document: data.document,
-          entities: data.entities,
-          relationships: data.relationships,
-        };
-
-        setProgress(100);
-
-        // Add entities and relationships to store
-        result.entities.forEach((entity) => addEntity(entity));
-        result.relationships.forEach((rel) => addRelationship(rel));
-
-        return result;
-      } catch (err: any) {
-        const errorMessage = err.message || "Failed to process file";
-        setError(errorMessage);
-        throw err;
-      } finally {
-        setIsProcessing(false);
-        setProgress(0);
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Processing failed");
       }
-    },
-    [addEntity, addRelationship]
-  );
 
-  const processText = useCallback(
-    async (text: string, filename: string = "text.txt"): Promise<ProcessingResult> => {
-      setIsProcessing(true);
-      setProgress(0);
-      setError(null);
+      const result = await response.json();
+      setProgress(100);
+      return result;
 
-      try {
-        setProgress(25);
+    } catch (err: any) {
+      console.error("Processing error:", err);
+      setError(err.message || "Failed to process file");
+      throw err;
+    } finally {
+      setIsProcessing(false);
+    }
+  }, []);
 
-        // Use API route for text processing (server-side only)
-        const formData = new FormData();
-        formData.append("text", text);
-
-        const response = await fetch("/api/process", {
-          method: "POST",
-          body: formData,
-        });
-
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || "Failed to process text");
-        }
-
-        setProgress(75);
-        const data = await response.json();
-
-        if (!data.success) {
-          throw new Error(data.error || "Processing failed");
-        }
-
-        const result: ProcessingResult = {
-          document: data.document,
-          entities: data.entities,
-          relationships: data.relationships,
-        };
-
-        setProgress(100);
-
-        // Add entities and relationships to store
-        result.entities.forEach((entity) => addEntity(entity));
-        result.relationships.forEach((rel) => addRelationship(rel));
-
-        return result;
-      } catch (err: any) {
-        const errorMessage = err.message || "Failed to process text";
-        setError(errorMessage);
-        throw err;
-      } finally {
-        setIsProcessing(false);
-        setProgress(0);
-      }
-    },
-    [addEntity, addRelationship]
-  );
-
-  return {
-    isProcessing,
-    progress,
-    error,
-    processFile,
-    processText,
-  };
+  return { processFile, isProcessing, progress, error };
 }
-

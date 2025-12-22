@@ -1,11 +1,5 @@
 import { OpenAIClient, AzureKeyCredential } from "@azure/openai";
-import type {
-  EntityExtractionResult,
-  ExtractedEntity,
-  ExtractedRelationship,
-  EntityType,
-  RelationshipType,
-} from "@/types";
+import type { EntityExtractionResult, ExtractedEntity, ExtractedRelationship, EntityType, RelationshipType } from "@/types";
 
 export class AzureOpenAIService {
   private client: OpenAIClient | null = null;
@@ -21,35 +15,72 @@ export class AzureOpenAIService {
     const apiKey = process.env.AZURE_OPENAI_API_KEY;
 
     if (!endpoint || !apiKey) {
-      console.warn(
-        "Azure OpenAI credentials not found. Entity extraction will not work."
-      );
+      console.warn("Azure OpenAI credentials not found.");
       return;
     }
 
     try {
-      this.client = new OpenAIClient(
-        endpoint,
-        new AzureKeyCredential(apiKey)
-      );
+      this.client = new OpenAIClient(endpoint, new AzureKeyCredential(apiKey));
     } catch (error) {
       console.error("Failed to initialize Azure OpenAI client:", error);
     }
   }
 
-  async extractEntitiesAndRelationships(
-    text: string
-  ): Promise<EntityExtractionResult> {
-    if (!this.client) {
-      throw new Error("Azure OpenAI client not initialized");
-    }
+  /**
+   * THE NEW METHOD: Extracts strictly based on the User's Mapping
+   * This prevents "RELATED_TO" because it follows the specific rules.
+   */
+  async extractGraphWithMapping(rowText: string, mapping: any[]): Promise<EntityExtractionResult> {
+    if (!this.client) throw new Error("Azure OpenAI client not initialized");
 
+    // 1. Convert the JSON mapping into strict English rules
+    const rules = mapping.map((m: any) => 
+      `- When you see column "${m.header_column}", create a relationship of type "${m.relationship_type}" pointing to the entity "${m.target_entity}".`
+    ).join("\n");
+
+    const prompt = `
+      You are a Strict Knowledge Graph Extractor.
+      
+      ### STRICT MAPPING RULES
+      You must extract relationships based ONLY on these rules. Do not invent others.
+      ${rules}
+
+      ### FORBIDDEN
+      - **DO NOT use "RELATED_TO"** under any circumstances.
+      - If a column does not match a rule, ignore it.
+
+      ### INPUT DATA ROW
+      ${rowText}
+
+      ### OUTPUT JSON FORMAT
+      {
+        "entities": [ 
+          {"type": "Entity", "label": "ExtractedValue", "confidence": 1.0} 
+        ],
+        "relationships": [ 
+          {"from": "SourceNode", "to": "TargetNode", "type": "RELATIONSHIP_TYPE", "confidence": 1.0} 
+        ]
+      }
+    `;
+
+    return this.callOpenAI(prompt, 0.0); // 0.0 temperature ensures strict rule following
+  }
+
+  // Fallback for generic text (Legacy support)
+  async extractEntitiesAndRelationships(text: string): Promise<EntityExtractionResult> {
+    const prompt = `
+      Analyze the text and extract entities.
+      STRICT RULE: Do not use "RELATED_TO". Use specific verbs like "WORKS_AT", "LOCATED_IN", etc.
+      
+      Input: ${text.substring(0, 8000)}
+    `;
+    return this.callOpenAI(prompt, 0.2);
+  }
+
+  private async callOpenAI(prompt: string, temperature: number): Promise<EntityExtractionResult> {
+    if (!this.client) throw new Error("Client not ready");
     const deploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME;
-    if (!deploymentName) {
-      throw new Error("AZURE_OPENAI_DEPLOYMENT_NAME not configured");
-    }
-
-    const prompt = this.buildExtractionPrompt(text);
+    if (!deploymentName) throw new Error("Deployment name missing");
 
     let attempt = 0;
     while (attempt < this.maxRetries) {
@@ -57,196 +88,40 @@ export class AzureOpenAIService {
         const response = await this.client.getChatCompletions(
           deploymentName,
           [
-            {
-              role: "system",
-              content:
-                "You are an expert at extracting entities and relationships from text. Always respond with valid JSON only, no additional text.",
-            },
-            {
-              role: "user",
-              content: prompt,
-            },
+            { role: "system", content: "You are a precise JSON extractor. Respond with valid JSON only." },
+            { role: "user", content: prompt }
           ],
-          {
-            temperature: 0.3,
-            maxTokens: 4000,
-            responseFormat: { type: "json_object" },
-          }
+          { temperature, maxTokens: 4000, responseFormat: { type: "json_object" } }
         );
 
         const content = response.choices[0]?.message?.content;
-        if (!content) {
-          throw new Error("No content in OpenAI response");
-        }
+        if (!content) throw new Error("No content");
+        return this.parseExtractionResult(content);
 
-        const result = this.parseExtractionResult(content);
-        return result;
       } catch (error: any) {
         attempt++;
-        if (attempt >= this.maxRetries) {
-          console.error("Failed to extract entities after retries:", error);
-          throw error;
-        }
-
-        // Exponential backoff
-        const delay = this.baseDelay * Math.pow(2, attempt - 1);
-        console.log(`Retrying entity extraction in ${delay}ms...`);
-        await this.sleep(delay);
+        if (attempt >= this.maxRetries) throw error;
+        await this.sleep(this.baseDelay * Math.pow(2, attempt - 1));
       }
     }
-
-    throw new Error("Failed to extract entities after all retries");
+    throw new Error("Retries exhausted");
   }
 
-  private buildExtractionPrompt(text: string): string {
-    return `Analyze the following text and extract entities and relationships. Return a JSON object with this exact structure:
-
-{
-  "entities": [
-    {
-      "id": "optional-unique-id",
-      "type": "Person|Organization|Location|Concept|Event|Technology",
-      "label": "Entity name",
-      "properties": {},
-      "confidence": 0.0-1.0
-    }
-  ],
-  "relationships": [
-    {
-      "from": "EXACT_ENTITY_LABEL",
-      "to": "EXACT_ENTITY_LABEL",
-      "type": "RELATED_TO|PART_OF|WORKS_AT|LOCATED_IN|MENTIONS|CREATED_BY",
-      "confidence": 0.0-1.0,
-      "properties": {}
-    }
-  ]
-}
-
-CRITICAL INSTRUCTIONS:
-1. For relationships, ALWAYS use the EXACT "label" value from the entities array
-2. DO NOT use IDs, generic names, or variations - use the exact label as it appears in entities
-3. Match relationship "from" and "to" fields exactly to entity labels
-4. Example: If an entity has label "Orion Logistics", use "Orion Logistics" (not "Orion", "orion_logistics", or "org1")
-
-Entity Types:
-- Person: Individual people
-- Organization: Companies, institutions, groups
-- Location: Places, cities, countries
-- Concept: Abstract ideas, topics
-- Event: Occurrences, happenings
-- Technology: Technologies, tools, systems
-
-Relationship Types:
-- RELATED_TO: General relationship
-- PART_OF: Entity is part of another
-- WORKS_AT: Person works at organization
-- LOCATED_IN: Entity is located in a place
-- MENTIONS: Entity mentions or references another
-- CREATED_BY: Entity was created by another
-
-Text to analyze:
-${text.substring(0, 8000)}`;
-  }
-
-  private parseExtractionResult(
-    content: string
-  ): EntityExtractionResult {
+  private parseExtractionResult(content: string): EntityExtractionResult {
     try {
-      // Remove markdown code blocks if present
-      const cleanedContent = content
-        .replace(/```json\n?/g, "")
-        .replace(/```\n?/g, "")
-        .trim();
-
-      const parsed = JSON.parse(cleanedContent);
-
-      // Validate and normalize structure
-      const entities: ExtractedEntity[] = Array.isArray(parsed.entities)
-        ? parsed.entities.map((e: any) => ({
-            id: e.id,
-            type: this.normalizeEntityType(e.type),
-            label: e.label || String(e.name || e.title || ""),
-            properties: e.properties || {},
-            confidence: this.normalizeConfidence(e.confidence),
-          }))
-        : [];
-
-      const relationships: ExtractedRelationship[] = Array.isArray(
-        parsed.relationships
-      )
-        ? parsed.relationships.map((r: any) => ({
-            from: String(r.from || ""),
-            to: String(r.to || ""),
-            type: this.normalizeRelationshipType(r.type),
-            confidence: this.normalizeConfidence(r.confidence),
-            properties: r.properties || {},
-          }))
-        : [];
-
-      return { entities, relationships };
-    } catch (error) {
-      console.error("Failed to parse extraction result:", error);
-      console.error("Content:", content);
-      throw new Error("Invalid JSON response from OpenAI");
+      const cleaned = content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      return {
+        entities: Array.isArray(parsed.entities) ? parsed.entities : [],
+        relationships: Array.isArray(parsed.relationships) ? parsed.relationships : []
+      };
+    } catch (e) {
+      console.error("JSON Parse Error", e);
+      return { entities: [], relationships: [] };
     }
   }
 
-  private normalizeEntityType(type: string): EntityType {
-    const normalized = type.trim();
-    const validTypes: EntityType[] = [
-      "Person",
-      "Organization",
-      "Location",
-      "Concept",
-      "Event",
-      "Technology",
-    ];
-
-    if (validTypes.includes(normalized as EntityType)) {
-      return normalized as EntityType;
-    }
-
-    // Fallback mapping
-    const lower = normalized.toLowerCase();
-    if (lower.includes("person") || lower.includes("people")) return "Person";
-    if (lower.includes("org") || lower.includes("company")) return "Organization";
-    if (lower.includes("location") || lower.includes("place")) return "Location";
-    if (lower.includes("event")) return "Event";
-    if (lower.includes("tech")) return "Technology";
-    return "Concept";
-  }
-
-  private normalizeRelationshipType(type: string | undefined | null): RelationshipType {
-    if (!type) {
-      return "RELATED_TO"; // Default fallback
-    }
-    
-    const normalized = String(type).trim().toUpperCase();
-    const validTypes: RelationshipType[] = [
-      "RELATED_TO",
-      "PART_OF",
-      "WORKS_AT",
-      "LOCATED_IN",
-      "MENTIONS",
-      "CREATED_BY",
-    ];
-
-    if (validTypes.includes(normalized as RelationshipType)) {
-      return normalized as RelationshipType;
-    }
-
-    return "RELATED_TO"; // Default fallback
-  }
-
-  private normalizeConfidence(confidence: any): number {
-    const conf = typeof confidence === "number" ? confidence : parseFloat(String(confidence || "0.5"));
-    return Math.max(0.0, Math.min(1.0, conf || 0.5));
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
+  private sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 }
 
 export const azureOpenAI = new AzureOpenAIService();
-
