@@ -24,55 +24,53 @@ export function useGraph() {
   } = useGraphStore();
 
   const loadGraph = useCallback(async (documentId?: string | null) => {
-    // Check if connected before loading
     const client = surrealDB.getClient();
     if (!client) {
-      throw new Error("SurrealDB client not connected. Call connect() first.");
+      console.error("SurrealDB client not connected.");
+      return;
     }
     
     setLoading(true);
     try {
-      let allEntities: Entity[];
-      let allRelationships: Relationship[];
+      let allEntities: Entity[] = [];
+      let allRelationships: Relationship[] = [];
 
+      // Fetch verified data from the database
       if (documentId) {
-        // Load entities and relationships for specific document
         [allEntities, allRelationships] = await Promise.all([
-          graphOps.getEntitiesByDocument(documentId),
+          graphOps.getAllEntities(), 
           graphOps.getAllRelationships(documentId),
         ]);
       } else {
-        // Load all entities and relationships
         [allEntities, allRelationships] = await Promise.all([
           graphOps.getAllEntities(),
           graphOps.getAllRelationships(),
         ]);
       }
 
+      // PRODUCTION INTEGRITY CHECK
+      // Instead of creating fake nodes, we simply log if data is missing
+      // The GraphVisualization component handles skipping edges to prevent crashes
+      const entityIds = new Set(allEntities.map(e => e.id));
+      const danglingEdges = allRelationships.filter(r => !entityIds.has(r.from) || !entityIds.has(r.to));
+      
+      if (danglingEdges.length > 0) {
+        console.warn(`[Data Integrity] Found ${danglingEdges.length} edges pointing to missing nodes. These will be hidden.`);
+      }
+
       setEntities(allEntities);
       setRelationships(allRelationships);
+
     } catch (error: any) {
-      // Handle connection and permission errors gracefully
-      if (error?.message?.includes("not connected")) {
-        console.warn("Graph loading skipped - connection not ready");
-        setEntities([]);
-        setRelationships([]);
-      } else if (error?.message?.includes("permissions") || error?.message?.includes("IAM error")) {
-        // Permission errors are already handled in graph-operations, but just in case
-        console.warn("Permission error loading graph. App will work with limited functionality.");
-        setEntities([]);
-        setRelationships([]);
-      } else {
-        console.error("Error loading graph:", error);
-        // Don't throw - just set empty arrays so app can still function
-        setEntities([]);
-        setRelationships([]);
-      }
+      console.error("Error loading graph data:", error);
+      setEntities([]);
+      setRelationships([]);
     } finally {
       setLoading(false);
     }
   }, [setEntities, setRelationships, setLoading]);
 
+  // Wrappers for store actions
   const createEntity = useCallback(
     async (entity: Omit<Entity, "id" | "createdAt" | "updatedAt">) => {
       setLoading(true);
@@ -124,24 +122,10 @@ export function useGraph() {
   );
 
   const createRelationship = useCallback(
-    async (
-      from: string,
-      to: string,
-      type: Relationship["type"],
-      properties?: Relationship["properties"],
-      confidence?: number,
-      source?: string
-    ) => {
+    async (from: string, to: string, type: Relationship["type"], properties?: any, confidence?: number) => {
       setLoading(true);
       try {
-        const created = await graphOps.createRelationship(
-          from,
-          to,
-          type,
-          properties,
-          confidence,
-          source
-        );
+        const created = await graphOps.createRelationship(from, to, type, properties, confidence);
         addRelationship(created);
         return created;
       } catch (error) {
@@ -159,7 +143,6 @@ export function useGraph() {
       setLoading(true);
       try {
         const updated = await graphOps.updateRelationship(id, updates);
-        // Update relationship in store
         updateRelationshipInStore(id, updated);
         return updated;
       } catch (error) {
@@ -170,22 +153,6 @@ export function useGraph() {
       }
     },
     [updateRelationshipInStore, setLoading]
-  );
-
-  const getRelationshipById = useCallback(
-    async (id: string): Promise<Relationship | null> => {
-      setLoading(true);
-      try {
-        const relationship = await graphOps.getRelationship(id);
-        return relationship;
-      } catch (error) {
-        console.error("Error getting relationship:", error);
-        throw error;
-      } finally {
-        setLoading(false);
-      }
-    },
-    [setLoading]
   );
 
   const removeRelationship = useCallback(
@@ -208,8 +175,7 @@ export function useGraph() {
     async (query: string) => {
       setLoading(true);
       try {
-        const results = await graphOps.searchEntities(query);
-        return results;
+        return await graphOps.searchEntities(query);
       } catch (error) {
         console.error("Error searching entities:", error);
         throw error;
@@ -224,8 +190,7 @@ export function useGraph() {
     async (entityId: string, depth: number = 1) => {
       setLoading(true);
       try {
-        const result = await graphOps.getNeighbors(entityId, depth);
-        return result;
+        return await graphOps.getNeighbors(entityId, depth);
       } catch (error) {
         console.error("Error getting neighbors:", error);
         throw error;
@@ -237,12 +202,10 @@ export function useGraph() {
   );
 
   return {
-    // State
     entities: Array.from(entities.values()),
     relationships,
     selectedEntity,
     selectedRelationship,
-    // Actions
     loadGraph,
     createEntity,
     updateEntity: updateEntityById,
@@ -250,11 +213,10 @@ export function useGraph() {
     createRelationship,
     updateRelationship: updateRelationshipById,
     deleteRelationship: removeRelationship,
-    getRelationship: getRelationshipById,
+    getRelationship: graphOps.getRelationship,
     searchEntities,
     getNeighbors,
     selectEntity: setSelectedEntity,
     selectRelationship: setSelectedRelationship,
   };
 }
-

@@ -13,13 +13,12 @@ export async function POST(request: NextRequest) {
     await surrealDB.connect();
     const db = await surrealDB.getClient();
 
-    // 2. Parse JSON Body (New Flow)
-    // The frontend must now send JSON with 'approvedMapping'
+    // 2. Parse JSON Body
     let body;
     try {
         body = await request.json();
     } catch (e) {
-        return NextResponse.json({ error: "Invalid JSON. Ensure you are sending 'Content-Type: application/json'" }, { status: 400 });
+        return NextResponse.json({ error: "Invalid JSON." }, { status: 400 });
     }
 
     const { textContent, fileName, approvedMapping, saveToMemory } = body;
@@ -28,14 +27,12 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: "No text content provided" }, { status: 400 });
     }
 
-    // 3. Save Configuration to Memory (If this is a new file type)
+    // 3. Save Configuration to Memory
     if (saveToMemory && approvedMapping) {
         try {
-            // Create a unique signature based on the columns
             const headers = approvedMapping.map((m: any) => m.header_column);
             const signature = headers.sort().join("|");
             
-            // Check if we already remembered this
             const [exists] = await db.query(`SELECT * FROM ${TABLES.DATA_SOURCE_CONFIG} WHERE signature = $sig`, { sig: signature });
             
             if (!exists[0]) {
@@ -52,60 +49,61 @@ export async function POST(request: NextRequest) {
         }
     }
 
-    // 4. Process the Content using the Strict Mapping
+    // 4. Process the Content
     const lines = textContent.split('\n');
-    
-    // Skip the header row if it matches our mapping keys
     const dataLines = lines.length > 0 && approvedMapping && lines[0].includes(approvedMapping[0]?.header_column) 
         ? lines.slice(1) 
         : lines;
 
-    const allEntities = [];
-    const allRelationships = [];
-
-    // Limit processing for the demo (to avoid timeout on Vercel/Free tier)
-    // In production, you would use a Queue (like BullMQ) here.
+    const allEntities: any[] = [];
+    const allRelationships: any[] = [];
     const BATCH_SIZE = 20; 
     const rowsToProcess = dataLines.slice(0, BATCH_SIZE);
 
-    console.log(` Processing ${rowsToProcess.length} rows using ${approvedMapping?.length || 0} strict rules...`); 
+    console.log(` Processing ${rowsToProcess.length} rows...`); 
 
     for (const row of rowsToProcess) {
         if (!row.trim()) continue;
-
-        // CRITICAL: We use the NEW method that forces the specific relationships
         const result = await azureOpenAI.extractGraphWithMapping(row, approvedMapping || []);
-        
         if (result.entities) allEntities.push(...result.entities);
         if (result.relationships) allRelationships.push(...result.relationships);
     }
 
     // 5. Insert into SurrealDB
-    // We use a helper to sanitize IDs (remove spaces, special chars)
     const sanitizeId = (label: string) => label.trim().replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
 
-    // A. Insert Entities
+    // A. Insert Entities (FIXED)
+    console.log(`Inserting ${allEntities.length} entities...`);
     for (const entity of allEntities) {
         try {
             const id = `entity:${sanitizeId(entity.label)}`;
-            // MERGE ensures we don't overwrite existing data, just update it
+            
+            // FIX: Nest properties inside 'properties' object to satisfy SCHEMAFULL definition
             await db.merge(id, {
                 label: entity.label,
                 type: entity.type,
-                ...entity.properties
+                properties: entity.properties || {}, // Nested correctly
+                updatedAt: new Date().toISOString()
             });
-        } catch (e) { /* Ignore duplicates */ }
+        } catch (e: any) { 
+            console.error(`Failed to insert entity ${entity.label}:`, e.message); 
+        }
     }
 
     // B. Insert Relationships
+    console.log(`Inserting ${allRelationships.length} relationships...`);
     for (const rel of allRelationships) {
         try {
             const fromId = `entity:${sanitizeId(rel.from)}`;
             const toId = `entity:${sanitizeId(rel.to)}`;
             
-            // The magic line: Create the specific edge (e.g., BANKED_AT)
-            await db.query(`RELATE ${fromId}->${rel.type}->${toId} SET confidence = ${rel.confidence || 1.0}`);
-        } catch (e) { /* Ignore errors */ }
+            // Sanitize relationship type too
+            const relType = rel.type.replace(/[^a-zA-Z0-9_]/g, '_').toUpperCase();
+
+            await db.query(`RELATE ${fromId}->${relType}->${toId} SET confidence = ${rel.confidence || 1.0}`);
+        } catch (e: any) { 
+             console.error(`Failed to insert relationship:`, e.message);
+        }
     }
 
     return NextResponse.json({
@@ -114,7 +112,6 @@ export async function POST(request: NextRequest) {
         entityCount: allEntities.length,
         relationshipCount: allRelationships.length,
       },
-      // Return samples for the UI to display immediately
       entities: allEntities.slice(0, 50),
       relationships: allRelationships.slice(0, 50)
     });
