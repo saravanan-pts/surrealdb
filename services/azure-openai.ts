@@ -1,10 +1,10 @@
 import { OpenAIClient, AzureKeyCredential } from "@azure/openai";
-import type { EntityExtractionResult, ExtractedEntity, ExtractedRelationship, EntityType, RelationshipType } from "@/types";
+import type { EntityExtractionResult } from "@/types";
 
 export class AzureOpenAIService {
   private client: OpenAIClient | null = null;
-  private maxRetries: number = 3;
-  private baseDelay: number = 1000;
+  private maxRetries = 3;
+  private baseDelay = 1000;
 
   constructor() {
     this.initializeClient();
@@ -26,55 +26,62 @@ export class AzureOpenAIService {
     }
   }
 
-  /**
-   * THE NEW METHOD: Extracts strictly based on the User's Mapping
-   * This prevents "RELATED_TO" because it follows the specific rules.
-   */
+  // --- MERGED LOGIC: Strict Mapping + Event Detection ---
   async extractGraphWithMapping(rowText: string, mapping: any[]): Promise<EntityExtractionResult> {
     if (!this.client) throw new Error("Azure OpenAI client not initialized");
 
-    // 1. Convert the JSON mapping into strict English rules
+    // 1. Convert User Mapping to Rules
     const rules = mapping.map((m: any) => 
-      `- When you see column "${m.header_column}", create a relationship of type "${m.relationship_type}" pointing to the entity "${m.target_entity}".`
+      `- If you see column "${m.header_column}", create relationship "${m.relationship_type}" to entity "${m.target_entity}".`
     ).join("\n");
 
+    // 2. Combined Prompt (Strict + Events)
     const prompt = `
-      You are a Strict Knowledge Graph Extractor.
+      You are an expert in Knowledge Graphs and Process Mining.
       
-      ### STRICT MAPPING RULES
-      You must extract relationships based ONLY on these rules. Do not invent others.
+      ### PART 1: USER MAPPING RULES
       ${rules}
 
-      ### FORBIDDEN
-      - **DO NOT use "RELATED_TO"** under any circumstances.
-      - If a column does not match a rule, ignore it.
+      ### PART 2: EVENT & TIME RULES (CRITICAL)
+      1. **Identify the Event:** If the row describes an action (e.g., "Login", "Purchase", "Claim"), label that node as 'Event', 'Activity', or 'Transaction'.
+      2. **Timestamps:** If you find a Date or Time, do **NOT** create a separate node. Instead, add it as a property called 'timestamp' to the Event node.
+      3. **Entities:** Extract other entities (Customer, Branch, etc.) as usual.
 
-      ### INPUT DATA ROW
+      ### PART 3: FORBIDDEN (STRICT MODE)
+      - **DO NOT use "RELATED_TO"** under any circumstances. Use specific verbs (e.g. "PERFORMED", "OCCURRED_AT") or the ones defined in the mapping.
+      - If a column does not match a rule or an event property, **IGNORE IT**. Do not invent relationships.
+
+      ### INPUT DATA
       ${rowText}
 
       ### OUTPUT JSON FORMAT
       {
         "entities": [ 
-          {"type": "Entity", "label": "ExtractedValue", "confidence": 1.0} 
+          {"type": "Event", "label": "Login", "confidence": 1.0, "properties": { "timestamp": "2023-10-01T10:00:00Z" }},
+          {"type": "Customer", "label": "C001", "confidence": 1.0}
         ],
         "relationships": [ 
-          {"from": "SourceNode", "to": "TargetNode", "type": "RELATIONSHIP_TYPE", "confidence": 1.0} 
+          {"from": "C001", "to": "Login", "type": "PERFORMED", "confidence": 1.0} 
         ]
       }
     `;
 
-    return this.callOpenAI(prompt, 0.0); // 0.0 temperature ensures strict rule following
+    return this.callOpenAI(prompt, 0.0);
   }
 
-  // Fallback for generic text (Legacy support)
+  // Fallback for raw text (Legacy support)
   async extractEntitiesAndRelationships(text: string): Promise<EntityExtractionResult> {
     const prompt = `
-      Analyze the text and extract entities.
-      STRICT RULE: Do not use "RELATED_TO". Use specific verbs like "WORKS_AT", "LOCATED_IN", etc.
+      Analyze this text as an Event Log / Audit Trail.
+      
+      ### RULES
+      1. **Events:** Identify specific events/actions.
+      2. **Timestamps:** Extract timestamps as properties of Event nodes (do not create Date nodes).
+      3. **STRICT VERBS:** Do NOT use "RELATED_TO". Use specific verbs like "WORKS_AT", "LOCATED_IN", "PERFORMED".
       
       Input: ${text.substring(0, 8000)}
     `;
-    return this.callOpenAI(prompt, 0.2);
+    return this.callOpenAI(prompt, 0.1);
   }
 
   private async callOpenAI(prompt: string, temperature: number): Promise<EntityExtractionResult> {
