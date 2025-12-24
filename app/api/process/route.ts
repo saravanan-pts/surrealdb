@@ -2,125 +2,123 @@ import { NextRequest, NextResponse } from "next/server";
 import { surrealDB } from "@/lib/surrealdb-client";
 import { azureOpenAI } from "@/services/azure-openai";
 import { TABLES } from "@/lib/schema";
+import { graphOps } from "@/services/graph-operations";
 
-// Ensure this route only runs on the server
 export const runtime = "nodejs";
-export const maxDuration = 300; // 5 minutes for large files
+export const maxDuration = 300;
 
 export async function POST(request: NextRequest) {
   try {
-    // 1. Connect to DB
+    // 1. Connect
     await surrealDB.connect();
-    const db = await surrealDB.getClient();
+    const db = surrealDB.getClient();
 
-    // 2. Parse JSON Body
     let body;
-    try {
-        body = await request.json();
-    } catch (e) {
-        return NextResponse.json({ error: "Invalid JSON." }, { status: 400 });
-    }
+    try { body = await request.json(); } 
+    catch (e) { return NextResponse.json({ error: "Invalid JSON" }, { status: 400 }); }
 
-    const { textContent, fileName, approvedMapping, saveToMemory } = body;
+    const { textContent, fileName, approvedMapping } = body;
+    if (!textContent) return NextResponse.json({ error: "No text content" }, { status: 400 });
 
-    if (!textContent) {
-        return NextResponse.json({ error: "No text content provided" }, { status: 400 });
-    }
+    // 2. Create Document Record
+    const document = await graphOps.createDocument({
+        filename: fileName || "input.txt",
+        content: textContent,
+        fileType: "text",
+        processedAt: new Date().toISOString(),
+        entityCount: 0,
+        relationshipCount: 0
+    });
 
-    // 3. Save Configuration to Memory
-    if (saveToMemory && approvedMapping) {
+    // 3. Extract Data from AI
+    const result = await azureOpenAI.extractGraphWithMapping(textContent.slice(0, 15000), approvedMapping || []);
+    
+    // 4. Insert Entities
+    const sanitizeId = (label: string) => label ? label.trim().replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase() : "unknown";
+    
+    console.log(`Inserting ${result.entities.length} entities...`);
+    let entitiesInserted = 0;
+
+    for (const entity of result.entities) {
         try {
-            const headers = approvedMapping.map((m: any) => m.header_column);
-            const signature = headers.sort().join("|");
-            
-            const [exists] = await db.query(`SELECT * FROM ${TABLES.DATA_SOURCE_CONFIG} WHERE signature = $sig`, { sig: signature });
-            
-            if (!exists[0]) {
-                await db.create(TABLES.DATA_SOURCE_CONFIG, {
-                    signature,
-                    last_file_name: fileName,
-                    approved_mapping: approvedMapping,
-                    created_at: new Date().toISOString()
-                });
-                console.log(" Knowledge Graph learned a new file format."); 
-            }
-        } catch (err) {
-            console.warn("Failed to save config to memory:", err);
-        }
-    }
-
-    // 4. Process the Content
-    const lines = textContent.split('\n');
-    const dataLines = lines.length > 0 && approvedMapping && lines[0].includes(approvedMapping[0]?.header_column) 
-        ? lines.slice(1) 
-        : lines;
-
-    const allEntities: any[] = [];
-    const allRelationships: any[] = [];
-    const BATCH_SIZE = 20; 
-    const rowsToProcess = dataLines.slice(0, BATCH_SIZE);
-
-    console.log(` Processing ${rowsToProcess.length} rows...`); 
-
-    for (const row of rowsToProcess) {
-        if (!row.trim()) continue;
-        const result = await azureOpenAI.extractGraphWithMapping(row, approvedMapping || []);
-        if (result.entities) allEntities.push(...result.entities);
-        if (result.relationships) allRelationships.push(...result.relationships);
-    }
-
-    // 5. Insert into SurrealDB
-    const sanitizeId = (label: string) => label.trim().replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
-
-    // A. Insert Entities (FIXED)
-    console.log(`Inserting ${allEntities.length} entities...`);
-    for (const entity of allEntities) {
-        try {
+            if(!entity.label) continue;
             const id = `entity:${sanitizeId(entity.label)}`;
-            
-            // FIX: Nest properties inside 'properties' object to satisfy SCHEMAFULL definition
-            await db.merge(id, {
-                label: entity.label,
-                type: entity.type,
-                properties: entity.properties || {}, // Nested correctly
-                updatedAt: new Date().toISOString()
-            });
+            // Robust Insert (Create or Update)
+            try {
+                await db.create(id, {
+                    label: entity.label,
+                    type: entity.type || "Concept",
+                    properties: entity.properties || {}, 
+                    metadata: { source: document.id },
+                    updatedAt: new Date().toISOString()
+                });
+            } catch (err) {
+                await db.merge(id, {
+                    properties: entity.properties || {},
+                    updatedAt: new Date().toISOString()
+                });
+            }
+            entitiesInserted++;
         } catch (e: any) { 
-            console.error(`Failed to insert entity ${entity.label}:`, e.message); 
+            console.error(`Entity Error:`, e.message); 
         }
     }
 
-    // B. Insert Relationships
-    console.log(`Inserting ${allRelationships.length} relationships...`);
-    for (const rel of allRelationships) {
+    // -----------------------------------------------------------------------
+    // 4A. KEY FIX: UNLOCK ALL DYNAMIC TABLES (HAS_ACCOUNT, BELONGS_TO, etc.)
+    // -----------------------------------------------------------------------
+    const uniqueRelTypes = new Set(result.relationships.map(r => 
+        (r.type || "RELATED_TO").replace(/[^a-zA-Z0-9_]/g, '_').toUpperCase()
+    ));
+
+    console.log(`Unlocking permissions for ${uniqueRelTypes.size} tables:`, Array.from(uniqueRelTypes));
+    
+    for (const type of Array.from(uniqueRelTypes)) {
         try {
+            // This ensures the 24+ tables are readable by the frontend
+            await db.query(`DEFINE TABLE ${type} SCHEMALESS PERMISSIONS FULL`);
+        } catch (e) {
+            console.warn(`Warning: Could not define permission for ${type}`, e);
+        }
+    }
+
+    // 5. Insert Relationships (Into their specific tables)
+    console.log(`Inserting ${result.relationships.length} relationships...`);
+    let relsInserted = 0;
+
+    for (const rel of result.relationships) {
+        try {
+            if(!rel.from || !rel.to) continue;
             const fromId = `entity:${sanitizeId(rel.from)}`;
             const toId = `entity:${sanitizeId(rel.to)}`;
-            
-            // Sanitize relationship type too
-            const relType = rel.type.replace(/[^a-zA-Z0-9_]/g, '_').toUpperCase();
+            // Use the dynamic table name (e.g., HAS_ACCOUNT)
+            const relType = (rel.type || "RELATED_TO").replace(/[^a-zA-Z0-9_]/g, '_').toUpperCase();
 
-            await db.query(`RELATE ${fromId}->${relType}->${toId} SET confidence = ${rel.confidence || 1.0}`);
+            await db.query(`
+                RELATE ${fromId}->${relType}->${toId} 
+                SET confidence = 1.0, 
+                    source = $doc
+            `, { 
+                doc: document.id 
+            });
+            relsInserted++;
         } catch (e: any) { 
-             console.error(`Failed to insert relationship:`, e.message);
+             console.error(`Edge Error:`, e.message);
         }
     }
+
+    // 6. Update Stats
+    await graphOps.updateDocument(document.id, { entityCount: entitiesInserted, relationshipCount: relsInserted });
 
     return NextResponse.json({
       success: true,
-      stats: {
-        entityCount: allEntities.length,
-        relationshipCount: allRelationships.length,
-      },
-      entities: allEntities.slice(0, 50),
-      relationships: allRelationships.slice(0, 50)
+      stats: { entitiesInserted, relsInserted },
+      entities: result.entities.slice(0, 50),
+      relationships: result.relationships.slice(0, 50)
     });
 
   } catch (error: any) {
     console.error("Processing Error:", error);
-    return NextResponse.json(
-      { error: error.message || "Failed to process file" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }

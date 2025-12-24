@@ -10,12 +10,19 @@ async function checkData() {
     const database = process.env.NEXT_PUBLIC_SURREALDB_DATABASE;
     const username = process.env.NEXT_PUBLIC_SURREALDB_USERNAME;
     const password = process.env.NEXT_PUBLIC_SURREALDB_PASSWORD;
+    const token = process.env.NEXT_PUBLIC_SURREALDB_TOKEN;
     
     console.log('Connecting to SurrealDB...');
     await db.connect(url);
     
-    if (username && password) {
+    if (token) {
+      await db.authenticate(token);
+      console.log('Authenticated using JWT token.');
+    } else if (username && password) {
       await db.signin({ user: username, pass: password });
+      console.log('Signed in using username and password.');
+    } else {
+      console.log('No credentials provided. Proceeding with anonymous access.');
     }
     
     await db.use({ ns: namespace, db: database });
