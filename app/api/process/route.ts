@@ -30,20 +30,37 @@ export async function POST(request: NextRequest) {
         relationshipCount: 0
     });
 
-    // 3. Extract Data from AI
-    const result = await azureOpenAI.extractGraphWithMapping(textContent.slice(0, 15000), approvedMapping || []);
-    
-    // 4. Insert Entities
-    const sanitizeId = (label: string) => label ? label.trim().replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase() : "unknown";
-    
-    console.log(`Inserting ${result.entities.length} entities...`);
-    let entitiesInserted = 0;
+    // 3. Process Sequentially (Essential for "NEXT" Logic)
+    const lines = textContent.split('\n').filter(line => line.trim().length > 0);
+    if(approvedMapping && lines.length > 0 && lines[0].includes(approvedMapping[0]?.header_column)) {
+        lines.shift(); // Skip Header
+    }
 
-    for (const entity of result.entities) {
-        try {
+    const BATCH_SIZE = 100; // Safe batch size
+    const rowsToProcess = lines.slice(0, BATCH_SIZE); 
+    
+    console.log(`Processing ${rowsToProcess.length} rows...`);
+
+    let entitiesInserted = 0;
+    let relsInserted = 0;
+    let lastEventId: string | null = null; 
+
+    for (const row of rowsToProcess) {
+        const result = await azureOpenAI.extractGraphWithMapping(row, approvedMapping || []);
+        
+        let currentEventId: string | null = null;
+        const sanitizeId = (label: string) => label ? label.trim().replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase() : "unknown";
+
+        // A. Insert Entities
+        for (const entity of result.entities) {
             if(!entity.label) continue;
             const id = `entity:${sanitizeId(entity.label)}`;
-            // Robust Insert (Create or Update)
+            
+            // Check if this is the "Event" node
+            if (['Event', 'Activity', 'Transaction', 'Log'].includes(entity.type)) {
+                currentEventId = id;
+            }
+
             try {
                 await db.create(id, {
                     label: entity.label,
@@ -59,62 +76,51 @@ export async function POST(request: NextRequest) {
                 });
             }
             entitiesInserted++;
-        } catch (e: any) { 
-            console.error(`Entity Error:`, e.message); 
         }
-    }
 
-    // -----------------------------------------------------------------------
-    // 4A. KEY FIX: UNLOCK ALL DYNAMIC TABLES (HAS_ACCOUNT, BELONGS_TO, etc.)
-    // -----------------------------------------------------------------------
-    const uniqueRelTypes = new Set(result.relationships.map(r => 
-        (r.type || "RELATED_TO").replace(/[^a-zA-Z0-9_]/g, '_').toUpperCase()
-    ));
-
-    console.log(`Unlocking permissions for ${uniqueRelTypes.size} tables:`, Array.from(uniqueRelTypes));
-    
-    for (const type of Array.from(uniqueRelTypes)) {
-        try {
-            // This ensures the 24+ tables are readable by the frontend
-            await db.query(`DEFINE TABLE ${type} SCHEMALESS PERMISSIONS FULL`);
-        } catch (e) {
-            console.warn(`Warning: Could not define permission for ${type}`, e);
-        }
-    }
-
-    // 5. Insert Relationships (Into their specific tables)
-    console.log(`Inserting ${result.relationships.length} relationships...`);
-    let relsInserted = 0;
-
-    for (const rel of result.relationships) {
-        try {
+        // B. Insert Relationships (With SELF-HEALING)
+        for (const rel of result.relationships) {
             if(!rel.from || !rel.to) continue;
             const fromId = `entity:${sanitizeId(rel.from)}`;
             const toId = `entity:${sanitizeId(rel.to)}`;
-            // Use the dynamic table name (e.g., HAS_ACCOUNT)
+            
+            // --- SELF-HEALING: Auto-create missing nodes ---
+            try { 
+                await db.create(fromId, { label: rel.from, type: "Implicit", metadata: { source: document.id } }); 
+            } catch(e) { /* Exists */ }
+            try { 
+                await db.create(toId, { label: rel.to, type: "Implicit", metadata: { source: document.id } }); 
+            } catch(e) { /* Exists */ }
+            // -----------------------------------------------
+
             const relType = (rel.type || "RELATED_TO").replace(/[^a-zA-Z0-9_]/g, '_').toUpperCase();
 
-            await db.query(`
-                RELATE ${fromId}->${relType}->${toId} 
-                SET confidence = 1.0, 
-                    source = $doc
-            `, { 
-                doc: document.id 
-            });
-            relsInserted++;
-        } catch (e: any) { 
-             console.error(`Edge Error:`, e.message);
+            // Unlock Table & Insert
+            try { 
+                await db.query(`DEFINE TABLE ${relType} SCHEMALESS PERMISSIONS FULL`); 
+                await db.query(`RELATE ${fromId}->${relType}->${toId} SET confidence=1.0, source=$doc`, { doc: document.id });
+                relsInserted++;
+            } catch (e) { console.error(e); }
         }
+
+        // C. Insert Timeline Chain
+        if (lastEventId && currentEventId) {
+            try {
+                await db.query(`DEFINE TABLE NEXT SCHEMALESS PERMISSIONS FULL`);
+                await db.query(`RELATE ${lastEventId}->NEXT->${currentEventId} SET type='Sequence', source=$doc`, { doc: document.id });
+                relsInserted++;
+            } catch (e) {}
+        }
+
+        if (currentEventId) lastEventId = currentEventId;
     }
 
-    // 6. Update Stats
     await graphOps.updateDocument(document.id, { entityCount: entitiesInserted, relationshipCount: relsInserted });
 
     return NextResponse.json({
       success: true,
       stats: { entitiesInserted, relsInserted },
-      entities: result.entities.slice(0, 50),
-      relationships: result.relationships.slice(0, 50)
+      entities: [], relationships: []
     });
 
   } catch (error: any) {
