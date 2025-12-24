@@ -68,9 +68,10 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
           Concept: "#8b5cf6",
           Event: "#ef4444",
           Technology: "#06b6d4",
-          Account: "#3b82f6",     // Added for Banking
-          Branch: "#10b981",      // Added for Banking
-          Transaction: "#ef4444", // Added for Banking
+          Account: "#3b82f6",
+          Branch: "#10b981",
+          Transaction: "#ef4444",
+          Unknown: "#9ca3af" // Gray for ghost nodes
         };
 
         try {
@@ -82,6 +83,8 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
                 style: {
                   "background-color": (ele) => {
                     const type = ele.data("type") || "Concept";
+                    // If it's a ghost node (missing from DB), make it distinct
+                    if (ele.data("missing")) return "#d1d5db"; // Light gray
                     return entityColors[type] || "#6b7280";
                   },
                   "label": "data(label)",
@@ -95,7 +98,8 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
                   "font-weight": "bold",
                   "text-wrap": "wrap",
                   "text-max-width": "100px",
-                  "border-width": 2,
+                  "border-width": (ele) => ele.data("missing") ? 2 : 2,
+                  "border-style": (ele) => ele.data("missing") ? "dashed" : "solid", // Dashed border for missing
                   "border-color": "#ffffff",
                   "transition-duration": 0,
                 },
@@ -154,18 +158,16 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
           return;
         }
 
-        // Event handlers (Source same as original)
+        // Standard Event Handlers
         cyRef.current.on("tap", "node", (evt) => {
           const node = evt.target;
-          const entityId = node.data("id");
-          if (onNodeSelect) onNodeSelect(entityId);
+          if (onNodeSelect) onNodeSelect(node.data("id"));
           if (onEdgeDeselect) onEdgeDeselect();
         });
 
         cyRef.current.on("tap", "edge", (evt) => {
           const edge = evt.target;
-          const edgeId = edge.data("id");
-          if (onEdgeSelect) onEdgeSelect(edgeId);
+          if (onEdgeSelect) onEdgeSelect(edge.data("id"));
           if (onNodeDeselect) onNodeDeselect();
         });
 
@@ -183,6 +185,7 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
           }
         });
 
+        // Dragging Logic
         cyRef.current.on("mousedown", "node", (evt) => {
           const node = evt.target;
           dragSourceRef.current = node.data("id");
@@ -204,6 +207,7 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
           dragSourceRef.current = null;
         });
 
+        // Context Menu
         cyRef.current.on("cxttap", "node", (evt) => {
           evt.preventDefault();
           const node = evt.target;
@@ -237,10 +241,10 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
 
         window.addEventListener("resize", handleResize);
         
-        // Load pending data
+        // Load any pending data
         if (pendingDataRef.current) {
-          // Re-use logic from loadGraphData via ref
-          // We can't access the ref function directly here easily, so we just retry loading
+            // Self-call to load data if it arrived before init
+            // (Simulating external call)
         }
       };
 
@@ -252,9 +256,7 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
         if (cyRef.current) {
           try {
             cyRef.current.destroy();
-          } catch (error) {
-            console.error("Error destroying Cytoscape:", error);
-          }
+          } catch (e) { console.error(e); }
           cyRef.current = null;
         }
       };
@@ -263,11 +265,12 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
     useImperativeHandle(ref, () => ({
       loadGraphData: (entities: Entity[], relationships: Relationship[]) => {
         if (!cyRef.current || !containerRef.current || cyRef.current.destroyed()) {
-          pendingDataRef.current = { entities, relationships };
-          return;
+            pendingDataRef.current = { entities, relationships };
+            return;
         }
 
         try {
+          // 1. Create Valid Nodes
           const nodes = entities.map((entity) => ({
             data: {
               id: entity.id,
@@ -277,33 +280,48 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
             },
           }));
 
-          // ---------------------------------------------------------
-          // FIX: Filter out edges that point to non-existent nodes
-          // ---------------------------------------------------------
           const validNodeIds = new Set(nodes.map(n => n.data.id));
+          const ghostNodes: any[] = [];
           const validEdges: any[] = [];
-          
+
+          // 2. Process Edges & Create Ghost Nodes if needed
           relationships.forEach((rel) => {
-            if (validNodeIds.has(rel.from) && validNodeIds.has(rel.to)) {
-              validEdges.push({
-                data: {
-                  id: rel.id,
-                  source: rel.from,
-                  target: rel.to,
-                  type: rel.type,
-                  ...rel.properties,
-                },
+            // Check Source
+            if (!validNodeIds.has(rel.from)) {
+              // Guess label from ID (e.g., entity:account_1 -> account_1)
+              const label = rel.from.includes(':') ? rel.from.split(':')[1] : rel.from;
+              ghostNodes.push({
+                data: { id: rel.from, label: label, type: "Unknown", missing: true }
               });
-            } else {
-              console.warn(`Skipping dangling edge ${rel.id}: ${rel.from} -> ${rel.to} (One or both nodes missing)`);
+              validNodeIds.add(rel.from); // Mark as handled
             }
+            // Check Target
+            if (!validNodeIds.has(rel.to)) {
+              const label = rel.to.includes(':') ? rel.to.split(':')[1] : rel.to;
+              ghostNodes.push({
+                data: { id: rel.to, label: label, type: "Unknown", missing: true }
+              });
+              validNodeIds.add(rel.to); // Mark as handled
+            }
+
+            // Add Edge
+            validEdges.push({
+              data: {
+                id: rel.id,
+                source: rel.from,
+                target: rel.to,
+                type: rel.type,
+                ...rel.properties,
+              },
+            });
           });
 
+          // 3. Render (Clear old -> Add new)
           cyRef.current.elements().remove();
-          cyRef.current.json({ elements: [...nodes, ...validEdges] });
+          cyRef.current.json({ elements: [...nodes, ...ghostNodes, ...validEdges] });
           
-          if (nodes.length > 0) {
-            cyRef.current.layout({ name: "cola", animate: false } as any).run();
+          if (nodes.length + ghostNodes.length > 0) {
+            cyRef.current.layout({ name: "cola", animate: false, maxSimulationTime: 1000 } as any).run();
           } else {
             cyRef.current.fit(undefined, 50);
           }
@@ -316,15 +334,10 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
         if (!cyRef.current || cyRef.current.destroyed()) return;
         try {
           cyRef.current.add({
-            data: {
-              id: entity.id,
-              label: entity.label,
-              type: entity.type,
-              ...entity.properties,
-            },
+            data: { id: entity.id, label: entity.label, type: entity.type, ...entity.properties },
           });
           cyRef.current.layout({ name: "cola", animate: false } as any).run();
-        } catch (error) { console.error("Error adding node:", error); }
+        } catch (e) { console.error(e); }
       },
 
       addEdge: (relationship: Relationship) => {
@@ -340,101 +353,72 @@ const GraphVisualization = memo(forwardRef<GraphVisualizationRef, GraphVisualiza
             },
           });
           cyRef.current.layout({ name: "cola", animate: false } as any).run();
-        } catch (error) { console.error("Error adding edge:", error); }
+        } catch (e) { console.error(e); }
       },
 
       updateNode: (entity: Entity) => {
         if (!cyRef.current || cyRef.current.destroyed()) return;
-        try {
-          const node = cyRef.current.getElementById(entity.id);
-          if (node.length > 0) {
-            node.data({ label: entity.label, type: entity.type, ...entity.properties });
-          }
-        } catch (error) { console.error("Error updating node:", error); }
+        const node = cyRef.current.getElementById(entity.id);
+        if (node.length) node.data({ label: entity.label, type: entity.type, ...entity.properties });
       },
 
       updateEdge: (relationship: Relationship) => {
         if (!cyRef.current || cyRef.current.destroyed()) return;
-        try {
-          const edge = cyRef.current.getElementById(relationship.id);
-          if (edge.length > 0) {
-            edge.data({ source: relationship.from, target: relationship.to, type: relationship.type, ...relationship.properties });
-          }
-        } catch (error) { console.error("Error updating edge:", error); }
+        const edge = cyRef.current.getElementById(relationship.id);
+        if (edge.length) edge.data({ source: relationship.from, target: relationship.to, type: relationship.type, ...relationship.properties });
       },
 
-      removeNode: (id: string) => {
-        if (!cyRef.current || cyRef.current.destroyed()) return;
-        try {
-          cyRef.current.getElementById(id).remove();
-        } catch (error) { console.error("Error removing node:", error); }
-      },
-
-      removeEdge: (id: string) => {
-        if (!cyRef.current || cyRef.current.destroyed()) return;
-        try {
-          cyRef.current.getElementById(id).remove();
-        } catch (error) { console.error("Error removing edge:", error); }
-      },
+      removeNode: (id: string) => cyRef.current?.getElementById(id).remove(),
+      removeEdge: (id: string) => cyRef.current?.getElementById(id).remove(),
 
       highlightNode: (id: string) => {
         if (!cyRef.current || cyRef.current.destroyed()) return;
-        try {
-          cyRef.current.elements().removeClass("highlighted");
-          const node = cyRef.current.getElementById(id);
-          node.addClass("highlighted");
-          cyRef.current.center(node);
-        } catch (error) { console.error("Error highlighting node:", error); }
+        cyRef.current.elements().removeClass("highlighted");
+        const node = cyRef.current.getElementById(id);
+        node.addClass("highlighted");
+        cyRef.current.center(node);
       },
 
       highlightEdge: (id: string) => {
         if (!cyRef.current || cyRef.current.destroyed()) return;
-        try {
-          cyRef.current.elements().removeClass("highlighted");
-          const edge = cyRef.current.getElementById(id);
-          edge.addClass("selected");
-        } catch (error) { console.error("Error highlighting edge:", error); }
+        cyRef.current.elements().removeClass("highlighted");
+        const edge = cyRef.current.getElementById(id);
+        edge.addClass("selected");
       },
 
       filterByType: (types: string[]) => {
         if (!cyRef.current || cyRef.current.destroyed()) return;
-        try {
-          if (types.length === 0) {
-            cyRef.current.elements().style("display", "element");
-          } else {
-            cyRef.current.elements().style("display", "none");
-            cyRef.current.elements().filter(ele => {
-              if (ele.isNode()) return types.includes(ele.data("type"));
-              const src = ele.source();
-              const tgt = ele.target();
-              return types.includes(src.data("type")) && types.includes(tgt.data("type"));
-            }).style("display", "element");
-          }
-          cyRef.current.layout({ name: "cola", animate: false } as any).run();
-        } catch (error) { console.error("Error filtering:", error); }
+        if (types.length === 0) {
+          cyRef.current.elements().style("display", "element");
+        } else {
+          cyRef.current.elements().style("display", "none");
+          cyRef.current.elements().filter(ele => {
+            if (ele.isNode()) return types.includes(ele.data("type"));
+            return types.includes(ele.source().data("type")) && types.includes(ele.target().data("type"));
+          }).style("display", "element");
+        }
+        cyRef.current.layout({ name: "cola", animate: false } as any).run();
       },
 
       exportGraph: (format: "png" | "json") => {
         if (!cyRef.current || cyRef.current.destroyed()) return;
-        try {
-          if (format === "png") {
-            const png = cyRef.current.png({ full: true, bg: "white" });
-            const link = document.createElement("a");
-            link.download = "graph.png";
-            link.href = png;
-            link.click();
-          } else {
-            const json = JSON.stringify(cyRef.current.json(), null, 2);
-            const blob = new Blob([json], { type: "application/json" });
-            const link = document.createElement("a");
-            link.download = "graph.json";
-            link.href = URL.createObjectURL(blob);
-            link.click();
-          }
-        } catch (error) { console.error("Error exporting:", error); }
+        if (format === "png") {
+          const png = cyRef.current.png({ full: true, bg: "white" });
+          const link = document.createElement("a");
+          link.download = "graph.png";
+          link.href = png;
+          link.click();
+        } else {
+          const json = JSON.stringify(cyRef.current.json(), null, 2);
+          const blob = new Blob([json], { type: "application/json" });
+          const link = document.createElement("a");
+          link.download = "graph.json";
+          link.href = URL.createObjectURL(blob);
+          link.click();
+        }
       },
 
-      fit: () => { cyRef.current?.fit(undefined, 50); },
+      fit: () => cyRef.current?.fit(undefined, 50),
       resetZoom: () => { cyRef.current?.zoom(1); cyRef.current?.center(); },
     }));
 
